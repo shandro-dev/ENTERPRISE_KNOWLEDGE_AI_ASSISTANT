@@ -1,10 +1,12 @@
 import os
+import threading
 from dotenv import load_dotenv
 from langchain_google_genai import (
     ChatGoogleGenerativeAI,
     GoogleGenerativeAIEmbeddings
 )
 from langchain_chroma import Chroma
+
 load_dotenv()
 
 
@@ -15,13 +17,11 @@ embeddings = GoogleGenerativeAIEmbeddings(
 )
 
 
-
 # VECTOR DB
 vectorstore = Chroma(
     persist_directory="./vector_db",
     embedding_function=embeddings
 )
-
 
 
 # LLM
@@ -32,9 +32,31 @@ llm = ChatGoogleGenerativeAI(
 )
 
 
-
 # CHAT MEMORY
 chat_history = []
+
+FIRST_TURNS = 2
+LAST_TURNS = 3
+
+
+def _build_history_text():
+    # Change 1: first 2 turns + last 3 turns instead of flat last 10 messages
+    if not chat_history:
+        return ""
+
+    total_turns = len(chat_history) // 2
+    first_msgs  = FIRST_TURNS * 2
+    last_msgs   = LAST_TURNS * 2
+
+    if total_turns <= FIRST_TURNS + LAST_TURNS:
+        recent = chat_history
+    else:
+        first     = chat_history[:first_msgs]
+        last      = chat_history[-last_msgs:]
+        separator = [("...", "...")]
+        recent    = first + separator + last
+
+    return "\n".join(f"{role}: {text}" for role, text in recent)
 
 
 # CHAT FUNCTION
@@ -42,13 +64,16 @@ def ask_question(question):
 
     global chat_history
 
-    # Last few messages only
-    history_text = "\n".join(chat_history[-10:])
+    history_text = _build_history_text()
 
+    # Change 2: rewrite + vector search run in parallel
+    rewrite_result = [question]
+    docs_result    = [None]
 
-    # Query Rewrite using chat history
-
-    rewrite_prompt = f"""
+    def do_rewrite():
+        if not history_text:
+            return                          # Change 3: skip rewrite on first turn
+        rewrite_prompt = f"""
 Conversation History:
 {history_text}
 
@@ -59,15 +84,20 @@ Rewrite the question into a standalone search query.
 
 Return only the rewritten query.
 """
+        rewrite_result[0] = llm.invoke(rewrite_prompt).content.strip()
 
-    rewritten_query = llm.invoke(rewrite_prompt).content.strip()
+    def do_search():
+        docs_result[0] = vectorstore.similarity_search(question, k=5)
 
+    t1 = threading.Thread(target=do_rewrite)
+    t2 = threading.Thread(target=do_search)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
-    # Retrieve Documents
-    docs = vectorstore.similarity_search(
-        rewritten_query,
-        k=5
-    )
+    # Retrieve Documents using rewritten query
+    docs = vectorstore.similarity_search(rewrite_result[0], k=5)
 
     context = "\n\n".join(
         doc.page_content
@@ -131,8 +161,8 @@ Answer professionally.
 
 
     # Save Chat Memory
-    chat_history.append(f"User: {question}")
-    chat_history.append(f"Assistant: {answer}")
+    chat_history.append(("User", question))
+    chat_history.append(("Assistant", answer))
 
     return answer
 
